@@ -7,7 +7,7 @@ services:
     environment:
       - TZ=${TZ:-Asia/Dhaka}
     ports:
-      - "8000:8000"
+      - "${HOST_PORT:-8000}:8000"
     volumes:
       - ./backend/data:/app/backend/data
       - ./backend/cv_store:/app/backend/cv_store
