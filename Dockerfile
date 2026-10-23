@@ -2,8 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# tzdata so the TZ env var (used by the scheduler) resolves correctly
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
+# tzdata so the TZ env var (used by the scheduler) resolves correctly;
+# Pango + fonts for WeasyPrint (tailored CV PDFs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tzdata libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 \
+        fonts-crosextra-carlito fonts-liberation2 fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 COPY requirements.txt .

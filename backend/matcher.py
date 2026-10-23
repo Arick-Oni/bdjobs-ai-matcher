@@ -59,6 +59,16 @@ def post_gemini(payload: Dict[str, Any]) -> Dict[str, Any]:
     _key_cursor += 1
     raise RuntimeError(f"All {len(keys)} Gemini key(s) failed ({last_err})")
 
+def ask_gemini_json(prompt: str, temperature: float = 0.2) -> Any:
+    """One Gemini call that must return JSON. Raises on failure (no keyword fallback)."""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature, "responseMimeType": "application/json"},
+    }
+    res_data = post_gemini(payload)
+    raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return json.loads(raw_text)
+
 def extract_cv_text(pdf_path: str) -> str:
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"CV PDF file not found at: {pdf_path}")

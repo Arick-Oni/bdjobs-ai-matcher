@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>BDJobs AI Matcher | Mobile App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light">
+    <title>AI Career Matcher</title>
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -18,7 +19,7 @@
         <header class="app-header">
             <div class="brand">
                 <div class="logo-icon">
-                    <i class="fa-solid fa-brain-circuit"></i>
+                    <i class="fa-solid fa-brain"></i>
                 </div>
                 <div>
                     <h1>AI Career Matcher</h1>
@@ -112,6 +113,7 @@
                 <button class="tab-btn active" data-filter="all">All Jobs</button>
                 <button class="tab-btn" data-filter="HIGH">High Fit 🔥</button>
                 <button class="tab-btn" data-filter="MEDIUM">Medium ⚡</button>
+                <button class="tab-btn" data-filter="tailored"><i class="fa-solid fa-pen-nib"></i> Tailored</button>
                 <button class="tab-btn" data-filter="src-bdjobs"><i class="fa-solid fa-briefcase"></i> BDJobs</button>
                 <button class="tab-btn" data-filter="src-linkedin"><i class="fa-brands fa-linkedin"></i> LinkedIn</button>
                 <button class="tab-btn" data-filter="src-remotive"><i class="fa-solid fa-globe"></i> Remotive</button>
@@ -124,7 +126,7 @@
             <div class="empty-state" id="empty-state">
                 <div class="empty-icon"><i class="fa-solid fa-briefcase"></i></div>
                 <h3>No Jobs Fetched Yet</h3>
-                <p>Tap <strong>"Fetch & Match Today's Jobs"</strong> above to extract BDJobs listings and match them against your CV using Gemini AI.</p>
+                <p>Tap <strong>"Fetch & Match"</strong> above to pull job listings and score them against your CV with Gemini.</p>
             </div>
         </main>
     </div>
@@ -133,7 +135,7 @@
     <div class="modal-overlay hidden" id="cv-modal">
         <div class="modal-card">
             <div class="modal-header">
-                <h3><i class="fa-solid fa-file-user"></i> Manage CV Profile</h3>
+                <h3><i class="fa-solid fa-id-card"></i> Manage CV</h3>
                 <button class="close-btn" id="btn-close-cv-modal"><i class="fa-solid fa-xmark"></i></button>
             </div>
             <div class="modal-body">
@@ -142,6 +144,24 @@
                     <h4 id="cv-filename">Loading...</h4>
                     <p class="cv-meta" id="cv-meta">Size: -- | Updated</p>
                     <div class="cv-preview-text" id="cv-preview">Preview text loading...</div>
+                </div>
+
+                <div class="active-cv-box master-cv-box">
+                    <span class="cv-label">Master CV (used for tailoring)</span>
+                    <p id="master-cv-status">Loading...</p>
+                    <div class="card-actions">
+                        <button class="action-btn primary" id="btn-master-build"><i class="fa-solid fa-wand-magic-sparkles"></i> Build from PDF</button>
+                        <a class="action-btn" id="btn-master-preview" href="/api/master-cv/preview" target="_blank" rel="noopener"><i class="fa-regular fa-eye"></i> Preview</a>
+                        <button class="action-btn" id="btn-master-edit"><i class="fa-solid fa-code"></i> Edit</button>
+                    </div>
+                    <div id="master-editor-wrap" class="hidden master-cv-box">
+                        <p>Fix anything the AI got wrong. Tailoring only ever uses facts from this master CV.</p>
+                        <textarea class="json-editor" id="master-cv-json" spellcheck="false"></textarea>
+                        <div class="card-actions">
+                            <button class="action-btn primary" id="btn-master-save"><i class="fa-solid fa-floppy-disk"></i> Save</button>
+                            <button class="action-btn" id="btn-master-cancel">Cancel</button>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="upload-dropzone" id="dropzone">
@@ -154,6 +174,8 @@
             </div>
         </div>
     </div>
+
+    <div class="toast hidden" id="toast"></div>
 
     <script src="js/app.js"></script>
 </body>

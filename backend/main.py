@@ -1,5 +1,6 @@
 import os
 import json
+import html
 import shutil
 import threading
 import time
@@ -13,11 +14,11 @@ load_dotenv()
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 
 from backend.scraper import fetch_all_jobs
 from backend.matcher import match_jobs_to_cv, extract_cv_text
-from backend import notifier, jobs_db, telegram_bot
+from backend import notifier, jobs_db, telegram_bot, tailor, cv_render
 
 app = FastAPI(title="AI Career Matcher API (Multi-Platform BD & Remote)", version="2.0.0")
 
@@ -38,7 +39,6 @@ FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
 os.makedirs(CV_STORE_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-LATEST_MATCHES_FILE = os.path.join(DATA_DIR, "latest_matches.json")
 CURRENT_CV_FILE = os.path.join(CV_STORE_DIR, "current_cv.pdf")
 
 # Global task status for progress feedback
@@ -107,14 +107,22 @@ def get_status():
 
 @app.get("/api/latest-jobs")
 def get_latest_jobs():
-    if os.path.exists(LATEST_MATCHES_FILE):
-        try:
-            with open(LATEST_MATCHES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to read cache: {e}")
-    return {"jobs": [], "fetched_at": None, "total_count": 0}
+    # Straight from the DB so tailoring/applied status is always current
+    jobs = [{k: v for k, v in j.items() if k != "Description"} for j in jobs_db.active_jobs()]
+    return build_payload(jobs, jobs_db.last_run())
+
+def build_payload(jobs: List[Dict[str, Any]], fetched_at: Optional[str]) -> Dict[str, Any]:
+    return {
+        "fetched_at": fetched_at,
+        "total_count": len(jobs),
+        "high_count": sum(1 for j in jobs if j.get("Match_Level") == "HIGH"),
+        "medium_count": sum(1 for j in jobs if j.get("Match_Level") == "MEDIUM"),
+        "low_count": sum(1 for j in jobs if j.get("Match_Level") in ["LOW", "IRRELEVANT"]),
+        "bdjobs_count": sum(1 for j in jobs if j.get("Source") == "BDJobs"),
+        "linkedin_count": sum(1 for j in jobs if j.get("Source") == "LinkedIn"),
+        "remotive_count": sum(1 for j in jobs if j.get("Source") == "Remotive"),
+        "jobs": jobs,
+    }
 
 def run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, sources_list: List[str]):
     if not run_lock.acquire(blocking=False):
@@ -145,23 +153,8 @@ def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, 
 
         scored_new = match_jobs_to_cv(cv_path, new_jobs)
         summary = jobs_db.update(jobs, scored_new, cv_path)
-        matched_jobs = jobs_db.active_jobs()
 
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        result_payload = {
-            "fetched_at": timestamp_str,
-            "total_count": len(matched_jobs),
-            "high_count": sum(1 for j in matched_jobs if j.get("Match_Level") == "HIGH"),
-            "medium_count": sum(1 for j in matched_jobs if j.get("Match_Level") == "MEDIUM"),
-            "low_count": sum(1 for j in matched_jobs if j.get("Match_Level") in ["LOW", "IRRELEVANT"]),
-            "bdjobs_count": sum(1 for j in matched_jobs if j.get("Source") == "BDJobs"),
-            "linkedin_count": sum(1 for j in matched_jobs if j.get("Source") == "LinkedIn"),
-            "remotive_count": sum(1 for j in matched_jobs if j.get("Source") == "Remotive"),
-            "jobs": matched_jobs
-        }
-
-        with open(LATEST_MATCHES_FILE, "w", encoding="utf-8") as f:
-            json.dump(result_payload, f, ensure_ascii=False, indent=2)
 
         execution_status["is_running"] = False
         execution_status["step"] = "Done"
@@ -256,11 +249,128 @@ def start_run_from_bot() -> str:
     ).start()
     return "🔄 Fetching and matching jobs now. I'll send the updated list when it's done."
 
+# ---------- CV tailoring ----------
+
+def start_tailoring(job: Dict[str, Any]) -> str:
+    """Starts tailoring in the background; the result goes to Telegram (if set up) and the web app."""
+    cv_path = get_active_cv_path()
+    if not cv_path:
+        return "No CV uploaded yet. Upload one in the web app first."
+    existing = jobs_db.get_tailored(job_id=job["Job_ID"])
+    if existing and existing["status"] == "working":
+        return f"⏳ #{job.get('Num')} is already being tailored."
+    jobs_db.save_tailored(job, status="working", error=None)
+
+    def run():
+        try:
+            t = tailor.tailor_job(job, cv_path, progress=lambda m: print(f"[Tailor #{job.get('Num')}] {m}"))
+            if notifier.is_configured():
+                notifier.send_tailored_result(t)
+        except Exception as e:
+            print(f"[Tailor #{job.get('Num')}] Failed: {e}")
+            if notifier.is_configured():
+                try:
+                    notifier.send_message(f"❌ Tailoring #{job.get('Num')} failed: {str(e)[:300]}")
+                except Exception:
+                    pass
+
+    threading.Thread(target=run, daemon=True).start()
+    return (f"✍️ Tailoring your CV for <b>#{job.get('Num')} {html.escape(job.get('Title', ''))}</b> at {html.escape(job.get('Company', ''))}. "
+            "This takes about a minute — I'll send the PDF here.")
+
+def _tailored_or_404(job_id: str) -> Dict[str, Any]:
+    t = jobs_db.get_tailored(job_id=job_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Not tailored yet.")
+    return t
+
+@app.post("/api/tailor/{job_id}")
+def api_tailor(job_id: str):
+    job = jobs_db.get_job(job_id=job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found (it may have expired).")
+    return {"status": "started", "message": start_tailoring(job)}
+
+@app.get("/api/tailored")
+def api_tailored_list():
+    return [{k: v for k, v in t.items() if k != "result"} | {"keywords_after": t["result"].get("keywords_after", {}).get("percent")}
+            for t in jobs_db.list_tailored()]
+
+@app.get("/api/tailored/{job_id}")
+def api_tailored(job_id: str):
+    t = _tailored_or_404(job_id)
+    r = t["result"]
+    return {
+        "status": t["status"], "error": t["error"], "num": t["num"], "applied": t["applied"],
+        "created": t["created"], "cover_letter": t["cover_letter"], "job": t["job"],
+        "changes": r.get("changes", []), "gaps": r.get("gaps", []),
+        "removed_claims": r.get("removed_claims", []),
+        "keywords_before": r.get("keywords_before", {}), "keywords_after": r.get("keywords_after", {}),
+    }
+
+@app.get("/api/tailored/{job_id}/pdf")
+def api_tailored_pdf(job_id: str):
+    t = _tailored_or_404(job_id)
+    if t["status"] != "done" or not t["pdf_path"] or not os.path.exists(t["pdf_path"]):
+        raise HTTPException(status_code=404, detail="PDF not ready.")
+    return FileResponse(t["pdf_path"], media_type="application/pdf", filename=os.path.basename(t["pdf_path"]))
+
+@app.post("/api/tailored/{job_id}/cover")
+def api_cover_letter(job_id: str):
+    try:
+        return {"letter": tailor.cover_letter_for(job_id)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/tailored/{job_id}/applied")
+def api_mark_applied(job_id: str, applied: bool = True):
+    job = jobs_db.get_job(job_id=job_id) or (jobs_db.get_tailored(job_id=job_id) or {}).get("job")
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    extra = {} if jobs_db.get_tailored(job_id=job_id) else {"status": "none"}
+    jobs_db.save_tailored(job, applied=applied, **extra)
+    return {"applied": applied}
+
+@app.get("/api/master-cv")
+def api_master_cv():
+    stored = jobs_db.get_meta("master_cv")
+    cv_path = get_active_cv_path()
+    current = bool(stored and cv_path and stored.get("cv_hash") == jobs_db.file_hash(cv_path))
+    return {"cv": stored["cv"] if stored else None, "edited": bool(stored and stored.get("edited")), "up_to_date": current}
+
+@app.post("/api/master-cv/rebuild")
+def api_master_cv_rebuild():
+    cv_path = get_active_cv_path()
+    if not cv_path:
+        raise HTTPException(status_code=400, detail="Upload a CV PDF first.")
+    try:
+        return {"cv": tailor.build_master_cv(cv_path)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini failed: {e}")
+
+@app.put("/api/master-cv")
+def api_master_cv_save(cv: Dict[str, Any]):
+    cv_path = get_active_cv_path()
+    if not cv_path:
+        raise HTTPException(status_code=400, detail="Upload a CV PDF first.")
+    if not isinstance(cv.get("sections"), list) or not cv.get("name"):
+        raise HTTPException(status_code=400, detail="CV JSON needs at least 'name' and a 'sections' list.")
+    tailor.save_master_cv(cv_path, cv)
+    return {"status": "saved"}
+
+@app.get("/api/master-cv/preview", response_class=HTMLResponse)
+def api_master_cv_preview():
+    stored = jobs_db.get_meta("master_cv")
+    if not stored:
+        raise HTTPException(status_code=404, detail="Build the master CV first.")
+    return cv_render.render_html(stored["cv"])
+
 @app.on_event("startup")
 def start_background_workers():
+    jobs_db.reset_stuck_tailoring()
     if SCHEDULE_TIMES:
         threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
-    telegram_bot.start(start_run_from_bot, lambda: execution_status)
+    telegram_bot.start(start_run_from_bot, lambda: execution_status, start_tailoring)
 
 # Mount frontend static files
 if os.path.exists(FRONTEND_DIR):

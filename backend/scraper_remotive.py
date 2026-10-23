@@ -2,6 +2,8 @@ import requests
 import time
 from typing import List, Dict, Any
 
+from backend.job_details import html_to_text
+
 REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -74,7 +76,8 @@ def fetch_remotive_jobs(
                     "Salary": salary_str,
                     "Category_ID": clean_str(item.get("category")),
                     "Job_URL": clean_str(item.get("url")),
-                    "Source": "Remotive"
+                    "Source": "Remotive",
+                    "Description": html_to_text(item.get("description", ""))[:8000],
                 }
                 all_jobs.append(parsed_job)
 
