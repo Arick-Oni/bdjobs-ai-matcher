@@ -57,6 +57,16 @@ def _linkedin(job_id: str) -> str:
     return text
 
 
+def _remotive(job_id: str, title: str) -> str:
+    # The API has no single-job endpoint, so search by title and match the ID
+    res = requests.get("https://remotive.com/api/remote-jobs", params={"search": title}, headers=HEADERS, timeout=20)
+    res.raise_for_status()
+    for item in res.json().get("jobs", []):
+        if str(item.get("id")) == job_id:
+            return html_to_text(item.get("description", ""))
+    return ""
+
+
 def _generic(url: str) -> str:
     res = requests.get(url, headers=HEADERS, timeout=20)
     res.raise_for_status()
@@ -77,6 +87,8 @@ def fetch_description(job: Dict[str, Any]) -> str:
         text = _bdjobs(jid[3:])
     elif source == "LinkedIn" and jid.startswith("li_"):
         text = _linkedin(jid[3:])
+    elif source == "Remotive" and jid.startswith("rem_"):
+        text = _remotive(jid[4:], job.get("Title", "")) or _generic(job.get("Job_URL", ""))
     else:
         text = _generic(job.get("Job_URL", ""))
 
