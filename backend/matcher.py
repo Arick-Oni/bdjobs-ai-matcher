@@ -6,8 +6,10 @@ import glob
 from typing import List, Dict, Any, Tuple
 import pdfplumber
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+# Free tier limits requests per day, so pack many jobs into each request
+BATCH_SIZE = int(os.environ.get("GEMINI_BATCH_SIZE", "40"))
 
 _key_cursor = 0
 
@@ -32,7 +34,7 @@ def post_gemini(payload: Dict[str, Any]) -> Dict[str, Any]:
         idx = (_key_cursor + attempt) % len(keys)
         # Key goes in a header, not the URL, so it never shows up in error messages / logs
         headers = {"Content-Type": "application/json", "x-goog-api-key": keys[idx]}
-        res = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=60)
+        res = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=120)
         if res.status_code in (429, 403, 401) or res.status_code >= 500:
             last_err = f"key #{idx + 1} returned {res.status_code}"
             print(f"[Gemini] {last_err}, trying next key...")
@@ -112,7 +114,7 @@ Match_Level criteria:
             evals.append({"Job_ID": j.get("Job_ID"), "Match_Score": score, "Match_Level": level, "Match_Reason": reason, "AI_Scored": False})
         return evals
 
-def match_jobs_to_cv(cv_pdf_path: str, jobs: List[Dict[str, Any]], batch_size: int = 15) -> List[Dict[str, Any]]:
+def match_jobs_to_cv(cv_pdf_path: str, jobs: List[Dict[str, Any]], batch_size: int = BATCH_SIZE) -> List[Dict[str, Any]]:
     if not jobs:
         return []
 

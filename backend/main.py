@@ -134,12 +134,14 @@ def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, 
 
     try:
         jobs = fetch_all_jobs(sources=sources_list, is_fresher=is_fresher, deadline_today=deadline_today)
+        # Sources can list the same job twice (e.g. across BDJobs pages)
+        jobs = list({str(j.get("Job_ID")): j for j in jobs}.values())
 
         # Only jobs not already in the DB go to Gemini; known jobs keep their score
         _, new_jobs = jobs_db.split_known(jobs, cv_path)
 
         execution_status["step"] = "AI Matching"
-        execution_status["message"] = f"Evaluating fit for {len(new_jobs)} new jobs (of {len(jobs)} scraped) using Gemini 2.5 Flash AI..."
+        execution_status["message"] = f"Evaluating fit for {len(new_jobs)} new jobs (of {len(jobs)} scraped) using Gemini..."
 
         scored_new = match_jobs_to_cv(cv_path, new_jobs)
         summary = jobs_db.update(jobs, scored_new, cv_path)
