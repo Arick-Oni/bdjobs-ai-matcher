@@ -84,7 +84,7 @@ def poll_loop(start_run: Callable[[], str], get_status: Callable[[], Dict[str, A
             payload = {"timeout": 50, "allowed_updates": ["message"]}
             if offset is not None:
                 payload["offset"] = offset
-            updates = notifier.api("getUpdates", timeout=60, **payload).get("result", [])
+            updates = notifier.api("getUpdates", http_timeout=60, **payload).get("result", [])
         except Exception as e:
             print(f"[Telegram Bot] getUpdates error: {e}")
             time.sleep(10)

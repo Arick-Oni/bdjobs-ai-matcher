@@ -27,8 +27,8 @@ def min_score() -> int:
     return int(os.environ.get("NOTIFY_MIN_SCORE", "70"))
 
 
-def api(method: str, timeout: int = 15, **payload) -> Dict[str, Any]:
-    res = requests.post(TELEGRAM_API.format(token=_token(), method=method), json=payload, timeout=timeout)
+def api(method: str, http_timeout: int = 15, **payload) -> Dict[str, Any]:
+    res = requests.post(TELEGRAM_API.format(token=_token(), method=method), json=payload, timeout=http_timeout)
     if not res.ok:
         # Don't raise_for_status: its message contains the URL, which contains the bot token
         raise RuntimeError(f"Telegram {method} failed ({res.status_code}): {res.text[:200]}")
