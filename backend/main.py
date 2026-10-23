@@ -1,6 +1,8 @@
 import os
 import json
 import shutil
+import threading
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
@@ -15,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from backend.scraper import fetch_all_jobs
 from backend.matcher import match_jobs_to_cv, extract_cv_text
+from backend import notifier
 
 app = FastAPI(title="AI Career Matcher API (Multi-Platform BD & Remote)", version="2.0.0")
 
@@ -46,6 +49,16 @@ execution_status = {
     "last_updated": None,
     "error": None
 }
+run_lock = threading.Lock()
+
+def env_bool(name: str, default: bool) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+# Scheduled runs: comma separated HH:MM in the container's local time (TZ env var)
+SCHEDULE_TIMES = [t.strip() for t in os.environ.get("SCHEDULE_TIMES", "").split(",") if t.strip()]
+SCHEDULE_SOURCES = [s.strip() for s in os.environ.get("SCHEDULE_SOURCES", "bdjobs,linkedin,remotive").split(",") if s.strip()]
+SCHEDULE_FRESHER = env_bool("SCHEDULE_FRESHER", True)
+SCHEDULE_DEADLINE_TODAY = env_bool("SCHEDULE_DEADLINE_TODAY", True)
 
 def get_active_cv_path() -> Optional[str]:
     if os.path.exists(CURRENT_CV_FILE):
@@ -104,6 +117,15 @@ def get_latest_jobs():
     return {"jobs": [], "fetched_at": None, "total_count": 0}
 
 def run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, sources_list: List[str]):
+    if not run_lock.acquire(blocking=False):
+        print("[Runner] A run is already in progress, skipping.")
+        return
+    try:
+        _run_matching_process(cv_path, is_fresher, deadline_today, sources_list)
+    finally:
+        run_lock.release()
+
+def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, sources_list: List[str]):
     global execution_status
     execution_status["is_running"] = True
     execution_status["step"] = "Scraping Multi-Sites"
@@ -145,11 +167,27 @@ def run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, s
         execution_status["message"] = f"Successfully matched {len(matched_jobs)} jobs across {len(sources_list)} sources!"
         execution_status["last_updated"] = timestamp_str
 
+        try:
+            ai_scored = sum(1 for j in matched_jobs if j.get("AI_Scored"))
+            if ai_scored < len(matched_jobs) and notifier.is_configured():
+                notifier.send_message(
+                    f"⚠️ Gemini failed for {len(matched_jobs) - ai_scored} of {len(matched_jobs)} jobs "
+                    "(those were keyword-scored and not sent). Check the API key / quota."
+                )
+            notifier.notify_new_matches(matched_jobs)
+        except Exception as ne:
+            print(f"[Telegram Error] {ne}")
+
     except Exception as e:
         execution_status["is_running"] = False
         execution_status["step"] = "Error"
         execution_status["error"] = str(e)
         execution_status["message"] = f"Error during matching: {e}"
+        if notifier.is_configured():
+            try:
+                notifier.send_message(f"❌ Job matcher run failed: {e}")
+            except Exception as ne:
+                print(f"[Telegram Error] {ne}")
 
 @app.post("/api/match-jobs")
 def trigger_match_jobs(
@@ -173,6 +211,38 @@ def trigger_match_jobs(
 
     background_tasks.add_task(run_matching_process, cv_path, is_fresher, deadline_today, parsed_sources)
     return {"status": "started", "message": f"Job matching started for sources: {parsed_sources}"}
+
+@app.get("/api/schedule")
+def get_schedule():
+    return {
+        "times": SCHEDULE_TIMES,
+        "timezone": os.environ.get("TZ", "system default"),
+        "sources": SCHEDULE_SOURCES,
+        "is_fresher": SCHEDULE_FRESHER,
+        "deadline_today": SCHEDULE_DEADLINE_TODAY,
+        "telegram_configured": notifier.is_configured(),
+    }
+
+def scheduler_loop():
+    last_fired = None
+    print(f"[Scheduler] Running daily at {SCHEDULE_TIMES} (TZ={os.environ.get('TZ', 'system')})")
+    while True:
+        now = datetime.now()
+        key = now.strftime("%Y-%m-%d %H:%M")
+        if now.strftime("%H:%M") in SCHEDULE_TIMES and key != last_fired:
+            last_fired = key
+            cv_path = get_active_cv_path()
+            if cv_path:
+                print(f"[Scheduler] Starting scheduled run at {key}")
+                run_matching_process(cv_path, SCHEDULE_FRESHER, SCHEDULE_DEADLINE_TODAY, SCHEDULE_SOURCES)
+            else:
+                print("[Scheduler] No CV uploaded, skipping scheduled run.")
+        time.sleep(20)
+
+@app.on_event("startup")
+def start_scheduler():
+    if SCHEDULE_TIMES:
+        threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
 
 # Mount frontend static files
 if os.path.exists(FRONTEND_DIR):

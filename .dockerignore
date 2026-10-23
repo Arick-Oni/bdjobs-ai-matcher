@@ -1,0 +1,8 @@
+.env
+.git
+.venv
+venv
+__pycache__
+*.pyc
+backend/data/*.json
+backend/cv_store/*.pdf

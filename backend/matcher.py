@@ -6,9 +6,8 @@ import glob
 from typing import List, Dict, Any, Tuple
 import pdfplumber
 
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL_NAME = "gemini-2.5-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
 def extract_cv_text(pdf_path: str) -> str:
     if not os.path.exists(pdf_path):
@@ -52,7 +51,8 @@ Match_Level criteria:
 - IRRELEVANT: Completely unrelated roles (e.g., Nurse, Peon, Delivery Man, Juice Maker, Driver, Caregiver).
 """
 
-    headers = {"Content-Type": "application/json"}
+    # Key goes in a header, not the URL, so it never shows up in error messages / logs
+    headers = {"Content-Type": "application/json", "x-goog-api-key": os.environ.get("GEMINI_API_KEY", "")}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
@@ -64,6 +64,9 @@ Match_Level criteria:
         res_data = res.json()
         raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
         matched_evals = json.loads(raw_text)
+        for ev in matched_evals:
+            if isinstance(ev, dict):
+                ev["AI_Scored"] = True
         return matched_evals
     except Exception as e:
         print(f"[Gemini API Warning] Batch eval failed ({e}). Using fallback keyword evaluator...")
@@ -76,7 +79,7 @@ Match_Level criteria:
                 score, level, reason = 40, "LOW", "General non-engineering role."
             else:
                 score, level, reason = 10, "IRRELEVANT", "Unrelated field."
-            evals.append({"Job_ID": j.get("Job_ID"), "Match_Score": score, "Match_Level": level, "Match_Reason": reason})
+            evals.append({"Job_ID": j.get("Job_ID"), "Match_Score": score, "Match_Level": level, "Match_Reason": reason, "AI_Scored": False})
         return evals
 
 def match_jobs_to_cv(cv_pdf_path: str, jobs: List[Dict[str, Any]], batch_size: int = 15) -> List[Dict[str, Any]]:
@@ -117,6 +120,7 @@ def match_jobs_to_cv(cv_pdf_path: str, jobs: List[Dict[str, Any]], batch_size: i
             j_copy["Match_Score"] = ev.get("Match_Score", 0)
             j_copy["Match_Level"] = ev.get("Match_Level", "IRRELEVANT")
             j_copy["Match_Reason"] = ev.get("Match_Reason", "")
+            j_copy["AI_Scored"] = ev.get("AI_Scored", False)
             evaluated_jobs.append(j_copy)
 
         if batch_num < total_batches:
