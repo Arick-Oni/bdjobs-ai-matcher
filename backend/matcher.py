@@ -9,6 +9,40 @@ import pdfplumber
 MODEL_NAME = "gemini-2.5-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
+_key_cursor = 0
+
+def gemini_keys() -> List[str]:
+    """GEMINI_API_KEYS (comma separated) plus GEMINI_API_KEY, de-duplicated."""
+    raw = os.environ.get("GEMINI_API_KEYS", "") + "," + os.environ.get("GEMINI_API_KEY", "")
+    keys = []
+    for k in raw.split(","):
+        k = k.strip()
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+def post_gemini(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Round-robins across keys; on rate-limit/quota/auth errors moves on to the next key."""
+    global _key_cursor
+    keys = gemini_keys()
+    if not keys:
+        raise RuntimeError("No Gemini API key configured")
+    last_err = None
+    for attempt in range(len(keys)):
+        idx = (_key_cursor + attempt) % len(keys)
+        # Key goes in a header, not the URL, so it never shows up in error messages / logs
+        headers = {"Content-Type": "application/json", "x-goog-api-key": keys[idx]}
+        res = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=60)
+        if res.status_code in (429, 403, 401) or res.status_code >= 500:
+            last_err = f"key #{idx + 1} returned {res.status_code}"
+            print(f"[Gemini] {last_err}, trying next key...")
+            continue
+        res.raise_for_status()
+        _key_cursor = idx + 1
+        return res.json()
+    _key_cursor += 1
+    raise RuntimeError(f"All {len(keys)} Gemini key(s) failed ({last_err})")
+
 def extract_cv_text(pdf_path: str) -> str:
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"CV PDF file not found at: {pdf_path}")
@@ -51,17 +85,13 @@ Match_Level criteria:
 - IRRELEVANT: Completely unrelated roles (e.g., Nurse, Peon, Delivery Man, Juice Maker, Driver, Caregiver).
 """
 
-    # Key goes in a header, not the URL, so it never shows up in error messages / logs
-    headers = {"Content-Type": "application/json", "x-goog-api-key": os.environ.get("GEMINI_API_KEY", "")}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
     }
 
     try:
-        res = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=30)
-        res.raise_for_status()
-        res_data = res.json()
+        res_data = post_gemini(payload)
         raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
         matched_evals = json.loads(raw_text)
         for ev in matched_evals:

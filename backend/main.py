@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from backend.scraper import fetch_all_jobs
 from backend.matcher import match_jobs_to_cv, extract_cv_text
-from backend import notifier
+from backend import notifier, jobs_db, telegram_bot
 
 app = FastAPI(title="AI Career Matcher API (Multi-Platform BD & Remote)", version="2.0.0")
 
@@ -135,16 +135,15 @@ def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, 
     try:
         jobs = fetch_all_jobs(sources=sources_list, is_fresher=is_fresher, deadline_today=deadline_today)
 
-        if not jobs:
-            execution_status["is_running"] = False
-            execution_status["step"] = "Done"
-            execution_status["message"] = "No jobs found for the selected filters."
-            return
+        # Only jobs not already in the DB go to Gemini; known jobs keep their score
+        _, new_jobs = jobs_db.split_known(jobs, cv_path)
 
         execution_status["step"] = "AI Matching"
-        execution_status["message"] = f"Evaluating fit for {len(jobs)} jobs using Gemini 2.5 Flash AI..."
+        execution_status["message"] = f"Evaluating fit for {len(new_jobs)} new jobs (of {len(jobs)} scraped) using Gemini 2.5 Flash AI..."
 
-        matched_jobs = match_jobs_to_cv(cv_path, jobs)
+        scored_new = match_jobs_to_cv(cv_path, new_jobs)
+        summary = jobs_db.update(jobs, scored_new, cv_path)
+        matched_jobs = jobs_db.active_jobs()
 
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         result_payload = {
@@ -164,17 +163,20 @@ def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, 
 
         execution_status["is_running"] = False
         execution_status["step"] = "Done"
-        execution_status["message"] = f"Successfully matched {len(matched_jobs)} jobs across {len(sources_list)} sources!"
+        execution_status["message"] = (
+            f"{summary['added']} new, {summary['expired']} expired, {summary['active']} open jobs "
+            f"across {len(sources_list)} sources."
+        )
         execution_status["last_updated"] = timestamp_str
 
         try:
-            ai_scored = sum(1 for j in matched_jobs if j.get("AI_Scored"))
-            if ai_scored < len(matched_jobs) and notifier.is_configured():
+            failed = sum(1 for j in scored_new if not j.get("AI_Scored"))
+            if failed and notifier.is_configured():
                 notifier.send_message(
-                    f"⚠️ Gemini failed for {len(matched_jobs) - ai_scored} of {len(matched_jobs)} jobs "
-                    "(those were keyword-scored and not sent). Check the API key / quota."
+                    f"⚠️ Gemini failed for {failed} of {len(scored_new)} new jobs "
+                    "(they'll be retried next run). Check the API key / quota."
                 )
-            notifier.notify_new_matches(matched_jobs)
+            notifier.send_daily_digest(summary)
         except Exception as ne:
             print(f"[Telegram Error] {ne}")
 
@@ -239,10 +241,24 @@ def scheduler_loop():
                 print("[Scheduler] No CV uploaded, skipping scheduled run.")
         time.sleep(20)
 
+def start_run_from_bot() -> str:
+    cv_path = get_active_cv_path()
+    if not cv_path:
+        return "No CV uploaded yet. Upload one in the web app first."
+    if run_lock.locked():
+        return "⏳ A run is already in progress."
+    threading.Thread(
+        target=run_matching_process,
+        args=(cv_path, SCHEDULE_FRESHER, SCHEDULE_DEADLINE_TODAY, SCHEDULE_SOURCES),
+        daemon=True,
+    ).start()
+    return "🔄 Fetching and matching jobs now. I'll send the updated list when it's done."
+
 @app.on_event("startup")
-def start_scheduler():
+def start_background_workers():
     if SCHEDULE_TIMES:
         threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
+    telegram_bot.start(start_run_from_bot, lambda: execution_status)
 
 # Mount frontend static files
 if os.path.exists(FRONTEND_DIR):

@@ -265,7 +265,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 try {
                     const isFresher = chkFresher ? chkFresher.checked : true;
                     const sourcesParam = encodeURIComponent(selectedSources.join(','));
-                    const res = await fetch(`/api/match-jobs?is_fresher=${isFresher}&deadline_today=true&sources=${sourcesParam}`, {
+                    const res = await fetch(`/api/match-jobs?is_fresher=${isFresher}&deadline_today=false&sources=${sourcesParam}`, {
                         method: 'POST'
                     });
 

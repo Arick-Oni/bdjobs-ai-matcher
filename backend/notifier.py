@@ -1,16 +1,14 @@
 import os
 import sys
-import json
 import html
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+from backend import jobs_db
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MESSAGE_LEN = 4000  # Telegram hard limit is 4096
-SEEN_CAP = 5000         # Keep the seen-IDs file from growing forever
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-NOTIFIED_FILE = os.path.join(BASE_DIR, "data", "notified_jobs.json")
+CLOSING_SOON_DAYS = 2
 
 
 def _token() -> str:
@@ -25,91 +23,92 @@ def is_configured() -> bool:
     return bool(_token() and _chat_id())
 
 
-def send_message(text: str) -> None:
-    res = requests.post(
-        TELEGRAM_API.format(token=_token(), method="sendMessage"),
-        json={
-            "chat_id": _chat_id(),
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=15,
-    )
+def min_score() -> int:
+    return int(os.environ.get("NOTIFY_MIN_SCORE", "70"))
+
+
+def api(method: str, timeout: int = 15, **payload) -> Dict[str, Any]:
+    res = requests.post(TELEGRAM_API.format(token=_token(), method=method), json=payload, timeout=timeout)
     if not res.ok:
         # Don't raise_for_status: its message contains the URL, which contains the bot token
-        raise RuntimeError(f"Telegram sendMessage failed ({res.status_code}): {res.text[:200]}")
+        raise RuntimeError(f"Telegram {method} failed ({res.status_code}): {res.text[:200]}")
+    return res.json()
 
 
-def _load_seen() -> List[str]:
-    try:
-        with open(NOTIFIED_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+def send_message(text: str, chat_id: Optional[str] = None) -> None:
+    api("sendMessage", chat_id=chat_id or _chat_id(), text=text, parse_mode="HTML", disable_web_page_preview=True)
 
 
-def _save_seen(seen: List[str]) -> None:
-    os.makedirs(os.path.dirname(NOTIFIED_FILE), exist_ok=True)
-    with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen[-SEEN_CAP:], f)
+def send_long(parts: List[str], chat_id: Optional[str] = None) -> int:
+    """Joins parts with blank lines, splitting into as few messages as fit. Returns message count."""
+    chunks, current = [], ""
+    for part in parts:
+        if current and len(current) + len(part) + 2 > MAX_MESSAGE_LEN:
+            chunks.append(current)
+            current = part
+        else:
+            current = f"{current}\n\n{part}" if current else part
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        send_message(chunk, chat_id)
+    return len(chunks)
 
 
-def _format_job(j: Dict[str, Any]) -> str:
+def format_job(j: Dict[str, Any], new_ids: set = frozenset()) -> str:
     e = lambda v: html.escape(str(v or ""))
+    tags = ""
+    if str(j.get("Job_ID")) in new_ids:
+        tags += "🆕 "
+    left = jobs_db.days_left(j)
+    if left is not None and left <= CLOSING_SOON_DAYS:
+        tags += "⏰ "
+    if left is None:
+        deadline = e(j.get("Deadline"))
+    elif left == 0:
+        deadline = f"{e(j.get('Deadline'))} (<b>today</b>)"
+    else:
+        deadline = f"{e(j.get('Deadline'))} ({left}d left)"
     lines = [
-        f"<b>{e(j.get('Match_Score'))}%</b> · <a href=\"{e(j.get('Job_URL'))}\">{e(j.get('Title'))}</a>",
+        f"{tags}<b>{e(j.get('Match_Score'))}%</b> · <a href=\"{e(j.get('Job_URL'))}\">{e(j.get('Title'))}</a>",
         f"🏢 {e(j.get('Company'))} · 📍 {e(j.get('Location'))}",
-        f"🗓 Deadline: {e(j.get('Deadline'))} · {e(j.get('Source'))}",
+        f"🗓 {deadline} · {e(j.get('Source'))}",
     ]
     if j.get("Match_Reason"):
         lines.append(f"<i>{e(j.get('Match_Reason'))}</i>")
     return "\n".join(lines)
 
 
-def notify_new_matches(jobs: List[Dict[str, Any]]) -> int:
-    """
-    Sends jobs that Gemini scored at or above NOTIFY_MIN_SCORE and that were never sent before.
-    Returns the number of jobs sent.
-    """
+def send_job_list(title: str, jobs: List[Dict[str, Any]], chat_id: Optional[str] = None, empty: str = "Nothing here right now.") -> None:
+    if not jobs:
+        send_message(f"{title}\n\n{empty}", chat_id)
+        return
+    new_ids = set(jobs_db.last_added_ids())
+    send_long([f"{title} ({len(jobs)})"] + [format_job(j, new_ids) for j in jobs], chat_id)
+
+
+def send_daily_digest(summary: Dict[str, Any]) -> None:
     if not is_configured():
-        print("[Telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping notification.")
-        return 0
+        print("[Telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping digest.")
+        return
 
-    min_score = int(os.environ.get("NOTIFY_MIN_SCORE", "70"))
-    seen = _load_seen()
-    seen_set = set(seen)
+    active = jobs_db.active_jobs()
+    top = [j for j in active if int(j.get("Match_Score") or 0) >= min_score()]
+    medium = [j for j in active if j.get("Match_Level") == "MEDIUM"]
+    closing = [j for j in top if (jobs_db.days_left(j) is not None and jobs_db.days_left(j) <= CLOSING_SOON_DAYS)]
+    new_ids = set(jobs_db.last_added_ids())
 
-    new_jobs = [
-        j for j in jobs
-        if j.get("AI_Scored")
-        and int(j.get("Match_Score") or 0) >= min_score
-        and str(j.get("Job_ID")) not in seen_set
-    ]
-    if not new_jobs:
-        print("[Telegram] No new matches to send.")
-        return 0
-
-    new_jobs.sort(key=lambda x: x.get("Match_Score", 0), reverse=True)
-
-    header = f"🎯 <b>{len(new_jobs)} new job match{'es' if len(new_jobs) != 1 else ''}</b> (score ≥ {min_score})"
-    chunks, current = [], header
-    for j in new_jobs:
-        block = _format_job(j)
-        if len(current) + len(block) + 2 > MAX_MESSAGE_LEN:
-            chunks.append(current)
-            current = block
-        else:
-            current += "\n\n" + block
-    chunks.append(current)
-
-    for chunk in chunks:
-        send_message(chunk)
-
-    seen.extend(str(j.get("Job_ID")) for j in new_jobs)
-    _save_seen(seen)
-    print(f"[Telegram] Sent {len(new_jobs)} new matches in {len(chunks)} message(s).")
-    return len(new_jobs)
+    header = (
+        f"📋 <b>Daily job list — {jobs_db.today():%b %d}</b>\n"
+        f"🆕 {summary.get('added', 0)} new · ❌ {summary.get('expired', 0)} expired & removed · "
+        f"⏰ {len(closing)} closing within {CLOSING_SOON_DAYS}d\n"
+        f"Showing {len(top)} open jobs scored ≥ {min_score()}."
+    )
+    # New first, then by score, so today's additions are at the top
+    top.sort(key=lambda j: (str(j.get("Job_ID")) not in new_ids, -int(j.get("Match_Score") or 0)))
+    footer = f"/medium for {len(medium)} medium matches · /closing · /help"
+    count = send_long([header] + [format_job(j, new_ids) for j in top] + [footer])
+    print(f"[Telegram] Daily digest sent: {len(top)} jobs in {count} message(s).")
 
 
 def print_chat_ids() -> None:
@@ -130,7 +129,7 @@ def print_chat_ids() -> None:
 
 
 if __name__ == "__main__":
-    # python -m backend.notifier chat-id   -> find your chat ID
+    # python -m backend.notifier chat-id   -> find your chat ID (stop the container first: the bot is polling)
     # python -m backend.notifier test      -> send a test message
     from dotenv import load_dotenv
     load_dotenv()
