@@ -20,8 +20,10 @@ h2 { font-size: 10.5pt; text-transform: uppercase; letter-spacing: 1.2px; color:
 .dates { color: #555; white-space: nowrap; font-size: 9.5pt; }
 .org { font-style: italic; color: #333; }
 .loc { color: #555; font-size: 9.5pt; white-space: nowrap; }
-ul { margin: 3px 0 0; padding-left: 15px; }
+/* Bullets as inline text (not list markers) so ATS text extraction keeps them next to each line */
+ul { margin: 3px 0 0; padding-left: 13px; list-style: none; }
 li { margin-bottom: 1.5px; }
+li::before { content: "• "; margin-left: -10px; }
 .skills p { margin: 0 0 2px; }
 .skills b { color: #111; }
 """
