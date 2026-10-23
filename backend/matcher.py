@@ -30,18 +30,32 @@ def post_gemini(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not keys:
         raise RuntimeError("No Gemini API key configured")
     last_err = None
-    for attempt in range(len(keys)):
-        idx = (_key_cursor + attempt) % len(keys)
-        # Key goes in a header, not the URL, so it never shows up in error messages / logs
-        headers = {"Content-Type": "application/json", "x-goog-api-key": keys[idx]}
-        res = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=120)
-        if res.status_code in (429, 403, 401) or res.status_code >= 500:
-            last_err = f"key #{idx + 1} returned {res.status_code}"
-            print(f"[Gemini] {last_err}, trying next key...")
-            continue
-        res.raise_for_status()
-        _key_cursor = idx + 1
-        return res.json()
+    # "High demand" 503s are temporary, so retry every key a few times with a growing pause
+    for round_num, pause in enumerate((0, 15, 45)):
+        if pause:
+            print(f"[Gemini] All keys overloaded, retrying in {pause}s...")
+            time.sleep(pause)
+        overloaded = False
+        for attempt in range(len(keys)):
+            idx = (_key_cursor + attempt) % len(keys)
+            # Key goes in a header, not the URL, so it never shows up in error messages / logs
+            headers = {"Content-Type": "application/json", "x-goog-api-key": keys[idx]}
+            try:
+                res = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=120)
+            except requests.exceptions.Timeout:
+                last_err, overloaded = f"key #{idx + 1} timed out", True
+                print(f"[Gemini] {last_err}, trying next key...")
+                continue
+            if res.status_code in (429, 403, 401) or res.status_code >= 500:
+                last_err = f"key #{idx + 1} returned {res.status_code}"
+                overloaded = overloaded or res.status_code >= 500
+                print(f"[Gemini] {last_err}, trying next key...")
+                continue
+            res.raise_for_status()
+            _key_cursor = idx + 1
+            return res.json()
+        if not overloaded:
+            break  # Only quota/auth errors: waiting won't help
     _key_cursor += 1
     raise RuntimeError(f"All {len(keys)} Gemini key(s) failed ({last_err})")
 
