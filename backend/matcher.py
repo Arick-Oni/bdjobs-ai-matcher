@@ -6,7 +6,7 @@ import glob
 from typing import List, Dict, Any, Tuple
 import pdfplumber
 
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 # Free tier limits requests per day, so pack many jobs into each request
 BATCH_SIZE = int(os.environ.get("GEMINI_BATCH_SIZE", "40"))
@@ -119,7 +119,7 @@ def match_jobs_to_cv(cv_pdf_path: str, jobs: List[Dict[str, Any]], batch_size: i
         return []
 
     cv_text = extract_cv_text(cv_pdf_path)
-    print(f"[AI Matcher] Loaded {len(jobs)} jobs. Evaluating with Gemini 2.5 Flash...")
+    print(f"[AI Matcher] Loaded {len(jobs)} jobs. Evaluating with {MODEL_NAME}...")
 
     evaluated_jobs = []
     total_batches = (len(jobs) + batch_size - 1) // batch_size
