@@ -6,3 +6,6 @@ __pycache__
 *.pyc
 backend/data/*.json
 backend/cv_store/*.pdf
+backend/data/*.db
+backend/data/tailored/
+backend/cv_store/**/*.pdf

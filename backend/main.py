@@ -1,5 +1,4 @@
 import os
-import json
 import html
 import shutil
 import threading
@@ -16,9 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 
-from backend.scraper import fetch_all_jobs
-from backend.matcher import match_jobs_to_cv, extract_cv_text
-from backend import notifier, jobs_db, telegram_bot, tailor, cv_render
+from backend.matcher import extract_cv_text
+from backend import notifier, jobs_db, telegram_bot, tailor, cv_render, pipeline
 
 app = FastAPI(title="AI Career Matcher API (Multi-Platform BD & Remote)", version="2.0.0")
 
@@ -32,14 +30,14 @@ app.add_middleware(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CV_STORE_DIR = os.path.join(BASE_DIR, "cv_store")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 FRONTEND_DIR = os.path.join(os.path.dirname(BASE_DIR), "frontend")
 
-os.makedirs(CV_STORE_DIR, exist_ok=True)
+os.makedirs(jobs_db.CV_STORE_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-CURRENT_CV_FILE = os.path.join(CV_STORE_DIR, "current_cv.pdf")
+# The web app always works on the owner's CV and matches. Other users are served through the Telegram bot.
+OWNER = jobs_db.OWNER_ID
 
 # Global task status for progress feedback
 execution_status = {
@@ -61,11 +59,10 @@ SCHEDULE_FRESHER = env_bool("SCHEDULE_FRESHER", True)
 SCHEDULE_DEADLINE_TODAY = env_bool("SCHEDULE_DEADLINE_TODAY", True)
 
 def get_active_cv_path() -> Optional[str]:
-    if os.path.exists(CURRENT_CV_FILE):
-        return CURRENT_CV_FILE
-    pdfs = [os.path.join(CV_STORE_DIR, f) for f in os.listdir(CV_STORE_DIR) if f.endswith(".pdf")]
-    if pdfs:
-        return pdfs[0]
+    """The owner's CV, or None if the owner hasn't uploaded one yet."""
+    owner = jobs_db.get_user(OWNER)
+    if owner and owner["status"] == "active" and owner["cv_path"] and os.path.exists(owner["cv_path"]):
+        return owner["cv_path"]
     return None
 
 @app.get("/api/cv-info")
@@ -73,7 +70,7 @@ def get_cv_info():
     cv_path = get_active_cv_path()
     if not cv_path or not os.path.exists(cv_path):
         return {"has_cv": False, "filename": None, "message": "No CV PDF uploaded yet."}
-    
+
     try:
         text = extract_cv_text(cv_path)
         preview = text[:300] + "..." if len(text) > 300 else text
@@ -91,9 +88,10 @@ async def upload_cv(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    dest_path = CURRENT_CV_FILE
+    dest_path = jobs_db.cv_path_for(OWNER)
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+    jobs_db.set_user_cv(OWNER, dest_path, jobs_db.file_hash(dest_path))
 
     return {
         "status": "success",
@@ -108,7 +106,7 @@ def get_status():
 @app.get("/api/latest-jobs")
 def get_latest_jobs():
     # Straight from the DB so tailoring/applied status is always current
-    jobs = [{k: v for k, v in j.items() if k != "Description"} for j in jobs_db.active_jobs()]
+    jobs = [{k: v for k, v in j.items() if k != "Description"} for j in jobs_db.active_jobs(OWNER)]
     return build_payload(jobs, jobs_db.last_run())
 
 def build_payload(jobs: List[Dict[str, Any]], fetched_at: Optional[str]) -> Dict[str, Any]:
@@ -124,56 +122,36 @@ def build_payload(jobs: List[Dict[str, Any]], fetched_at: Optional[str]) -> Dict
         "jobs": jobs,
     }
 
-def run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, sources_list: List[str]):
+def run_matching_process(is_fresher: bool, deadline_today: bool, sources_list: List[str]):
     if not run_lock.acquire(blocking=False):
         print("[Runner] A run is already in progress, skipping.")
         return
     try:
-        _run_matching_process(cv_path, is_fresher, deadline_today, sources_list)
+        _run_matching_process(is_fresher, deadline_today, sources_list)
     finally:
         run_lock.release()
 
-def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, sources_list: List[str]):
+def _run_matching_process(is_fresher: bool, deadline_today: bool, sources_list: List[str]):
     global execution_status
     execution_status["is_running"] = True
     execution_status["step"] = "Scraping Multi-Sites"
     execution_status["message"] = f"Fetching live jobs from {', '.join(sources_list)}..."
     execution_status["error"] = None
 
+    def progress(step: str, message: str) -> None:
+        execution_status["step"] = step
+        execution_status["message"] = message
+
     try:
-        jobs = fetch_all_jobs(sources=sources_list, is_fresher=is_fresher, deadline_today=deadline_today)
-        # Sources can list the same job twice (e.g. across BDJobs pages)
-        jobs = list({str(j.get("Job_ID")): j for j in jobs}.values())
-
-        # Only jobs not already in the DB go to Gemini; known jobs keep their score
-        _, new_jobs = jobs_db.split_known(jobs, cv_path)
-
-        execution_status["step"] = "AI Matching"
-        execution_status["message"] = f"Evaluating fit for {len(new_jobs)} new jobs (of {len(jobs)} scraped) using Gemini..."
-
-        scored_new = match_jobs_to_cv(cv_path, new_jobs)
-        summary = jobs_db.update(jobs, scored_new, cv_path)
-
-        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        summary = pipeline.run_all(sources_list, is_fresher, deadline_today, progress)
 
         execution_status["is_running"] = False
         execution_status["step"] = "Done"
         execution_status["message"] = (
             f"{summary['added']} new, {summary['expired']} expired, {summary['active']} open jobs "
-            f"across {len(sources_list)} sources."
+            f"across {len(sources_list)} sources, matched for {summary['users']} user(s)."
         )
-        execution_status["last_updated"] = timestamp_str
-
-        try:
-            failed = sum(1 for j in scored_new if not j.get("AI_Scored"))
-            if failed and notifier.is_configured():
-                notifier.send_message(
-                    f"⚠️ Gemini failed for {failed} of {len(scored_new)} new jobs "
-                    "(they'll be retried next run). Check the API key / quota."
-                )
-            notifier.send_daily_digest(summary)
-        except Exception as ne:
-            print(f"[Telegram Error] {ne}")
+        execution_status["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     except Exception as e:
         execution_status["is_running"] = False
@@ -188,16 +166,12 @@ def _run_matching_process(cv_path: str, is_fresher: bool, deadline_today: bool, 
 
 @app.post("/api/match-jobs")
 def trigger_match_jobs(
-    background_tasks: BackgroundTasks, 
-    is_fresher: bool = True, 
+    background_tasks: BackgroundTasks,
+    is_fresher: bool = True,
     deadline_today: bool = True,
     sources: str = Query("bdjobs,linkedin,remotive", description="Comma separated sources: bdjobs,linkedin,remotive")
 ):
     global execution_status
-
-    cv_path = get_active_cv_path()
-    if not cv_path:
-        raise HTTPException(status_code=400, detail="Please upload a CV PDF first.")
 
     if execution_status["is_running"]:
         return {"status": "in_progress", "message": "Scraping and matching is already running."}
@@ -206,7 +180,7 @@ def trigger_match_jobs(
     if not parsed_sources:
         parsed_sources = ["bdjobs", "linkedin", "remotive"]
 
-    background_tasks.add_task(run_matching_process, cv_path, is_fresher, deadline_today, parsed_sources)
+    background_tasks.add_task(run_matching_process, is_fresher, deadline_today, parsed_sources)
     return {"status": "started", "message": f"Job matching started for sources: {parsed_sources}"}
 
 @app.get("/api/schedule")
@@ -228,49 +202,47 @@ def scheduler_loop():
         key = now.strftime("%Y-%m-%d %H:%M")
         if now.strftime("%H:%M") in SCHEDULE_TIMES and key != last_fired:
             last_fired = key
-            cv_path = get_active_cv_path()
-            if cv_path:
-                print(f"[Scheduler] Starting scheduled run at {key}")
-                run_matching_process(cv_path, SCHEDULE_FRESHER, SCHEDULE_DEADLINE_TODAY, SCHEDULE_SOURCES)
-            else:
-                print("[Scheduler] No CV uploaded, skipping scheduled run.")
+            print(f"[Scheduler] Starting scheduled run at {key}")
+            run_matching_process(SCHEDULE_FRESHER, SCHEDULE_DEADLINE_TODAY, SCHEDULE_SOURCES)
         time.sleep(20)
 
-def start_run_from_bot() -> str:
-    cv_path = get_active_cv_path()
-    if not cv_path:
-        return "No CV uploaded yet. Upload one in the web app first."
+def start_run_from_bot(chat_id: str) -> str:
+    # Only the owner can trigger a full scrape; other users just get their own backlog scored
+    if chat_id != OWNER:
+        threading.Thread(target=pipeline.refresh_user, args=(chat_id,), daemon=True).start()
+        return "🔄 Matching newer jobs to your CV. I'll send your updated list when it's done."
     if run_lock.locked():
         return "⏳ A run is already in progress."
     threading.Thread(
         target=run_matching_process,
-        args=(cv_path, SCHEDULE_FRESHER, SCHEDULE_DEADLINE_TODAY, SCHEDULE_SOURCES),
+        args=(SCHEDULE_FRESHER, SCHEDULE_DEADLINE_TODAY, SCHEDULE_SOURCES),
         daemon=True,
     ).start()
     return "🔄 Fetching and matching jobs now. I'll send the updated list when it's done."
 
 # ---------- CV tailoring ----------
 
-def start_tailoring(job: Dict[str, Any]) -> str:
-    """Starts tailoring in the background; the result goes to Telegram (if set up) and the web app."""
-    cv_path = get_active_cv_path()
-    if not cv_path:
-        return "No CV uploaded yet. Upload one in the web app first."
-    existing = jobs_db.get_tailored(job_id=job["Job_ID"])
+def start_tailoring(chat_id: str, job: Dict[str, Any]) -> str:
+    """Starts tailoring in the background; the result goes to that user's Telegram chat (or the web app for the owner)."""
+    user = jobs_db.get_user(chat_id)
+    if not user or user["status"] != "active" or not user["cv_path"]:
+        return "Upload your CV first: send it to me as a PDF file."
+    cv_path = user["cv_path"]
+    existing = jobs_db.get_tailored(chat_id, job_id=job["Job_ID"])
     if existing and existing["status"] == "working":
         return f"⏳ #{job.get('Num')} is already being tailored."
-    jobs_db.save_tailored(job, status="working", error=None)
+    jobs_db.save_tailored(chat_id, job, status="working", error=None)
 
     def run():
         try:
-            t = tailor.tailor_job(job, cv_path, progress=lambda m: print(f"[Tailor #{job.get('Num')}] {m}"))
-            if notifier.is_configured():
-                notifier.send_tailored_result(t)
+            t = tailor.tailor_job(chat_id, job, cv_path, progress=lambda m: print(f"[Tailor #{job.get('Num')}] {m}"))
+            if notifier.is_configured() and notifier.is_telegram_chat(chat_id):
+                notifier.send_tailored_result(t, chat_id)
         except Exception as e:
             print(f"[Tailor #{job.get('Num')}] Failed: {e}")
-            if notifier.is_configured():
+            if notifier.is_configured() and notifier.is_telegram_chat(chat_id):
                 try:
-                    notifier.send_message(f"❌ Tailoring #{job.get('Num')} failed: {str(e)[:300]}")
+                    notifier.send_message(f"❌ Tailoring #{job.get('Num')} failed: {str(e)[:300]}", chat_id)
                 except Exception:
                     pass
 
@@ -279,7 +251,7 @@ def start_tailoring(job: Dict[str, Any]) -> str:
             "This takes about a minute — I'll send the PDF here.")
 
 def _tailored_or_404(job_id: str) -> Dict[str, Any]:
-    t = jobs_db.get_tailored(job_id=job_id)
+    t = jobs_db.get_tailored(OWNER, job_id=job_id)
     if not t:
         raise HTTPException(status_code=404, detail="Not tailored yet.")
     return t
@@ -289,12 +261,12 @@ def api_tailor(job_id: str):
     job = jobs_db.get_job(job_id=job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found (it may have expired).")
-    return {"status": "started", "message": start_tailoring(job)}
+    return {"status": "started", "message": start_tailoring(OWNER, job)}
 
 @app.get("/api/tailored")
 def api_tailored_list():
     return [{k: v for k, v in t.items() if k != "result"} | {"keywords_after": t["result"].get("keywords_after", {}).get("percent")}
-            for t in jobs_db.list_tailored()]
+            for t in jobs_db.list_tailored(OWNER)]
 
 @app.get("/api/tailored/{job_id}")
 def api_tailored(job_id: str):
@@ -318,22 +290,22 @@ def api_tailored_pdf(job_id: str):
 @app.post("/api/tailored/{job_id}/cover")
 def api_cover_letter(job_id: str):
     try:
-        return {"letter": tailor.cover_letter_for(job_id)}
+        return {"letter": tailor.cover_letter_for(OWNER, job_id)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/tailored/{job_id}/applied")
 def api_mark_applied(job_id: str, applied: bool = True):
-    job = jobs_db.get_job(job_id=job_id) or (jobs_db.get_tailored(job_id=job_id) or {}).get("job")
+    job = jobs_db.get_job(job_id=job_id) or (jobs_db.get_tailored(OWNER, job_id=job_id) or {}).get("job")
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    extra = {} if jobs_db.get_tailored(job_id=job_id) else {"status": "none"}
-    jobs_db.save_tailored(job, applied=applied, **extra)
+    extra = {} if jobs_db.get_tailored(OWNER, job_id=job_id) else {"status": "none"}
+    jobs_db.save_tailored(OWNER, job, applied=applied, **extra)
     return {"applied": applied}
 
 @app.get("/api/master-cv")
 def api_master_cv():
-    stored = jobs_db.get_meta("master_cv")
+    stored = jobs_db.get_meta(jobs_db.master_cv_key(OWNER))
     cv_path = get_active_cv_path()
     current = bool(stored and cv_path and stored.get("cv_hash") == jobs_db.file_hash(cv_path))
     return {"cv": stored["cv"] if stored else None, "edited": bool(stored and stored.get("edited")), "up_to_date": current}
@@ -344,7 +316,7 @@ def api_master_cv_rebuild():
     if not cv_path:
         raise HTTPException(status_code=400, detail="Upload a CV PDF first.")
     try:
-        return {"cv": tailor.build_master_cv(cv_path)}
+        return {"cv": tailor.build_master_cv(OWNER, cv_path)}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gemini failed: {e}")
 
@@ -355,12 +327,12 @@ def api_master_cv_save(cv: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Upload a CV PDF first.")
     if not isinstance(cv.get("sections"), list) or not cv.get("name"):
         raise HTTPException(status_code=400, detail="CV JSON needs at least 'name' and a 'sections' list.")
-    tailor.save_master_cv(cv_path, cv)
+    tailor.save_master_cv(OWNER, cv_path, cv)
     return {"status": "saved"}
 
 @app.get("/api/master-cv/preview", response_class=HTMLResponse)
 def api_master_cv_preview():
-    stored = jobs_db.get_meta("master_cv")
+    stored = jobs_db.get_meta(jobs_db.master_cv_key(OWNER))
     if not stored:
         raise HTTPException(status_code=404, detail="Build the master CV first.")
     return cv_render.render_html(stored["cv"])
@@ -368,9 +340,10 @@ def api_master_cv_preview():
 @app.on_event("startup")
 def start_background_workers():
     jobs_db.reset_stuck_tailoring()
+    jobs_db.ensure_owner()
     if SCHEDULE_TIMES:
         threading.Thread(target=scheduler_loop, daemon=True, name="scheduler").start()
-    telegram_bot.start(start_run_from_bot, lambda: execution_status, start_tailoring)
+    telegram_bot.start(start_run_from_bot, lambda: execution_status, start_tailoring, pipeline.refresh_user)
 
 # Mount frontend static files
 if os.path.exists(FRONTEND_DIR):

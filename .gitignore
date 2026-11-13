@@ -8,3 +8,7 @@ backend/data/*.json
 backend/cv_store/*.pdf
 !backend/cv_store/.gitkeep
 
+backend/cv_store/**/*.pdf
+backend/cv_store/**/*.tmp
+backend/data/*.db
+backend/data/tailored/

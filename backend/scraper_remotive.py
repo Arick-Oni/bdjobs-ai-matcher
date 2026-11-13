@@ -21,7 +21,7 @@ def fetch_remotive_jobs(
     """
     Fetches remote jobs from Remotive API suitable for candidates in Bangladesh or Worldwide.
     """
-    if categories is None:
+    if not categories:  # Only used when no user has chosen categories yet
         categories = ["software-dev", "data", "qa", "devops"]
 
     all_jobs = []

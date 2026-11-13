@@ -32,7 +32,7 @@ CV_SCHEMA = """{
 
 # ---------- Master CV ----------
 
-def build_master_cv(cv_path: str) -> Dict[str, Any]:
+def build_master_cv(chat_id: str, cv_path: str) -> Dict[str, Any]:
     text = extract_cv_text(cv_path)
     prompt = f"""Convert this CV into structured JSON using exactly this schema:
 {CV_SCHEMA}
@@ -50,20 +50,20 @@ CV text:
 \"\"\"
 """
     cv = ask_gemini_json(prompt, temperature=0.0)
-    jobs_db.set_meta("master_cv", {"cv_hash": jobs_db.file_hash(cv_path), "cv": cv, "edited": False})
+    jobs_db.set_meta(jobs_db.master_cv_key(chat_id), {"cv_hash": jobs_db.file_hash(cv_path), "cv": cv, "edited": False})
     return cv
 
 
-def get_master_cv(cv_path: str) -> Dict[str, Any]:
+def get_master_cv(chat_id: str, cv_path: str) -> Dict[str, Any]:
     """The structured master CV, rebuilt automatically when a different CV PDF is uploaded."""
-    stored = jobs_db.get_meta("master_cv")
+    stored = jobs_db.get_meta(jobs_db.master_cv_key(chat_id))
     if stored and stored.get("cv_hash") == jobs_db.file_hash(cv_path):
         return stored["cv"]
-    return build_master_cv(cv_path)
+    return build_master_cv(chat_id, cv_path)
 
 
-def save_master_cv(cv_path: str, cv: Dict[str, Any]) -> None:
-    jobs_db.set_meta("master_cv", {"cv_hash": jobs_db.file_hash(cv_path), "cv": cv, "edited": True})
+def save_master_cv(chat_id: str, cv_path: str, cv: Dict[str, Any]) -> None:
+    jobs_db.set_meta(jobs_db.master_cv_key(chat_id), {"cv_hash": jobs_db.file_hash(cv_path), "cv": cv, "edited": True})
 
 
 # ---------- Helpers ----------
@@ -212,8 +212,8 @@ Return JSON: {{"letter": "..."}}"""
 
 # ---------- Orchestration ----------
 
-def tailor_job(job: Dict[str, Any], cv_path: str, progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
-    """Runs the full pipeline for one job and stores the result. Returns the tailored record."""
+def tailor_job(chat_id: str, job: Dict[str, Any], cv_path: str, progress: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Runs the full pipeline for one job and stores the result for that user. Returns the tailored record."""
     from backend.cv_render import render_pdf
 
     say = progress or (lambda msg: None)
@@ -221,7 +221,7 @@ def tailor_job(job: Dict[str, Any], cv_path: str, progress: Optional[Callable[[s
 
     with _tailor_lock:
         try:
-            jobs_db.save_tailored(job, status="working", error=None)
+            jobs_db.save_tailored(chat_id, job, status="working", error=None)
 
             say("Reading the job description…")
             description = fetch_description(job)
@@ -229,7 +229,7 @@ def tailor_job(job: Dict[str, Any], cv_path: str, progress: Optional[Callable[[s
                 jobs_db.save_job_fields(jid, Description=description)
 
             say("Loading your master CV…")
-            master = get_master_cv(cv_path)
+            master = get_master_cv(chat_id, cv_path)
 
             say("Analysing what the job needs…")
             analysis = analyse_job(job, description)
@@ -248,9 +248,10 @@ def tailor_job(job: Dict[str, Any], cv_path: str, progress: Optional[Callable[[s
             before = keyword_coverage(keywords, cv_text(master))
             after = keyword_coverage(keywords, cv_text(tailored))
 
-            os.makedirs(TAILORED_DIR, exist_ok=True)
+            user_dir = os.path.join(TAILORED_DIR, str(chat_id))
+            os.makedirs(user_dir, exist_ok=True)
             filename = safe_filename(master.get("name", "CV"), "CV", job.get("Company", ""), job.get("Title", "")) + ".pdf"
-            pdf_path = os.path.join(TAILORED_DIR, filename)
+            pdf_path = os.path.join(user_dir, filename)
             render_pdf(tailored, pdf_path)
 
             result = {
@@ -263,20 +264,20 @@ def tailor_job(job: Dict[str, Any], cv_path: str, progress: Optional[Callable[[s
                 "cv": tailored,
                 "description": description,
             }
-            jobs_db.save_tailored(job, status="done", pdf_path=pdf_path, result=result, error=None)
-            return jobs_db.get_tailored(jid)
+            jobs_db.save_tailored(chat_id, job, status="done", pdf_path=pdf_path, result=result, error=None)
+            return jobs_db.get_tailored(chat_id, job_id=jid)
         except Exception as e:
-            jobs_db.save_tailored(job, status="failed", error=str(e))
+            jobs_db.save_tailored(chat_id, job, status="failed", error=str(e))
             raise
 
 
-def cover_letter_for(job_id: str) -> str:
-    t = jobs_db.get_tailored(job_id)
+def cover_letter_for(chat_id: str, job_id: str) -> str:
+    t = jobs_db.get_tailored(chat_id, job_id=job_id)
     if not t or t["status"] != "done":
         raise RuntimeError("Tailor the CV for this job first.")
     if t.get("cover_letter"):
         return t["cover_letter"]
     with _tailor_lock:
         letter = write_cover_letter(t["result"]["cv"], t["job"], t["result"].get("description", ""))
-    jobs_db.save_tailored(t["job"], cover_letter=letter)
+    jobs_db.save_tailored(chat_id, t["job"], cover_letter=letter)
     return letter

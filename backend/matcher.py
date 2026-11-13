@@ -81,15 +81,17 @@ def extract_cv_text(pdf_path: str) -> str:
     return text.strip()
 
 def call_gemini_batch_match(cv_summary: str, jobs_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    prompt = f"""You are an expert AI Career Assistant and Resume Evaluator.
+    # The CV is the only description of the candidate: several users with different careers share this prompt
+    prompt = f"""You are an expert career assistant and resume evaluator.
 
-Candidate CV Summary:
+Candidate CV:
 \"\"\"
-{cv_summary[:3000]}
+{cv_summary[:6000]}
 \"\"\"
 
 Task:
-Evaluate each of the following job listings for fit against the candidate's CV (Computer Science & Engineering graduate with background in Software Engineering, Machine Learning/AI, Data Science, Web/App Development, Python, Embedded Systems/IoT, Research/Academic roles).
+Evaluate each job listing below for fit against THIS candidate. Work out the candidate's field, degree, skills,
+experience and seniority from the CV text only. Do not assume any field, skill or tool that the CV does not show.
 
 Jobs to evaluate:
 {json.dumps(jobs_batch, indent=2)}
@@ -100,15 +102,16 @@ Respond ONLY with a valid JSON array of objects, one per job, in the exact same 
     "Job_ID": "...",
     "Match_Score": 85,
     "Match_Level": "HIGH",
-    "Match_Reason": "Directly matches candidate's ML/AI and Python background."
+    "Match_Reason": "One sentence citing specific evidence from the CV."
   }}
 ]
 
-Match_Level criteria:
-- HIGH: CS, Software, AI/ML, Data, Web, Tech, Research, Engineering, Teaching/Lecturer roles matching candidate.
-- MEDIUM: General tech, IT support, hardware, operations with basic CS/math component.
-- LOW: Marginal non-tech roles (e.g. general sales, admin, office assistant).
-- IRRELEVANT: Completely unrelated roles (e.g., Nurse, Peon, Delivery Man, Juice Maker, Driver, Caregiver).
+Match_Level criteria, judged against the candidate's own field:
+- HIGH (score 70-100): the role is in the candidate's field and fits their skills and experience level.
+- MEDIUM (score 45-69): a related field or partial fit (transferable skills, adjacent discipline, or a seniority mismatch).
+- LOW (score 20-44): marginal fit; only general skills would apply.
+- IRRELEVANT (score 0-19): unrelated to the candidate's field.
+Match_Reason must only mention qualifications that actually appear in the CV.
 """
 
     payload = {
@@ -137,6 +140,29 @@ Match_Level criteria:
                 score, level, reason = 10, "IRRELEVANT", "Unrelated field."
             evals.append({"Job_ID": j.get("Job_ID"), "Match_Score": score, "Match_Level": level, "Match_Reason": reason, "AI_Scored": False})
         return evals
+
+REMOTIVE_CATEGORIES = ["software-dev", "customer-support", "design", "marketing", "sales-business", "product",
+                       "project-management", "data", "devops", "finance", "human-resources", "qa", "writing"]
+
+
+def suggest_search_terms(cv_text: str) -> Dict[str, List[str]]:
+    """Job-search phrases for LinkedIn and Remotive categories that fit this CV. One Gemini request."""
+    prompt = f"""Read this CV and suggest how to search job boards for roles this person is qualified for.
+
+CV:
+\"\"\"
+{cv_text[:6000]}
+\"\"\"
+
+Respond ONLY with JSON:
+{{"keywords": ["4 to 6 short job-title search phrases, 1-3 words each, most relevant first"],
+  "remotive": ["0 to 3 of: {', '.join(REMOTIVE_CATEGORIES)}"]}}
+Use only fields the CV actually shows. Prefer titles at the person's level (e.g. "junior architect" for a recent graduate)."""
+    out = ask_gemini_json(prompt) or {}
+    keywords = [str(k).strip() for k in out.get("keywords", []) if str(k).strip()][:6]
+    remotive = [c for c in out.get("remotive", []) if c in REMOTIVE_CATEGORIES][:3]
+    return {"keywords": keywords, "remotive": remotive}
+
 
 def match_jobs_to_cv(cv_pdf_path: str, jobs: List[Dict[str, Any]], batch_size: int = BATCH_SIZE) -> List[Dict[str, Any]]:
     if not jobs:

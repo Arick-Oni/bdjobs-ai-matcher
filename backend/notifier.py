@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import html
 import requests
@@ -21,7 +22,13 @@ def _chat_id() -> str:
 
 
 def is_configured() -> bool:
-    return bool(_token() and _chat_id())
+    # Users register by messaging the bot, so the bot token is all that's needed
+    return bool(_token())
+
+
+def is_telegram_chat(chat_id: str) -> bool:
+    """False for the web-only owner placeholder, which has no Telegram chat behind it."""
+    return bool(re.fullmatch(r"-?\d+", str(chat_id)))
 
 
 def min_score() -> int:
@@ -40,11 +47,28 @@ def api(method: str, http_timeout: int = 15, files=None, **payload) -> Dict[str,
     return res.json()
 
 
+def download_file(file_id: str) -> bytes:
+    info = api("getFile", file_id=file_id)["result"]
+    res = requests.get(f"https://api.telegram.org/file/bot{_token()}/{info['file_path']}", timeout=60)
+    if not res.ok:
+        # Same as api(): keep the bot token out of error messages
+        raise RuntimeError(f"Telegram file download failed ({res.status_code})")
+    return res.content
+
+
+def _remember(chat_id: str, res: Dict[str, Any]) -> None:
+    """Records what was sent so it can be recalled later (python -m backend.recall)."""
+    try:
+        jobs_db.log_sent_message(chat_id, res["result"]["message_id"])
+    except Exception as e:
+        print(f"[Telegram] Could not record sent message: {e}")
+
+
 def send_message(text: str, chat_id: Optional[str] = None, buttons: Optional[List[List[Dict[str, str]]]] = None) -> None:
     payload = {"chat_id": chat_id or _chat_id(), "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
-    api("sendMessage", **payload)
+    _remember(payload["chat_id"], api("sendMessage", **payload))
 
 
 def send_document(path: str, caption: str = "", chat_id: Optional[str] = None,
@@ -54,7 +78,8 @@ def send_document(path: str, caption: str = "", chat_id: Optional[str] = None,
     if buttons:
         payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
     with open(path, "rb") as f:
-        api("sendDocument", files={"document": (os.path.basename(path), f, "application/pdf")}, **payload)
+        res = api("sendDocument", files={"document": (os.path.basename(path), f, "application/pdf")}, **payload)
+    _remember(payload["chat_id"], res)
 
 
 def tailor_buttons(nums: List[int]) -> List[List[Dict[str, str]]]:
@@ -116,32 +141,34 @@ def send_job_list(title: str, jobs: List[Dict[str, Any]], chat_id: Optional[str]
     if not jobs:
         send_message(f"{title}\n\n{empty}", chat_id)
         return
-    new_ids = set(jobs_db.last_added_ids())
+    new_ids = set(jobs_db.new_job_ids(chat_id or jobs_db.OWNER_ID))
     send_long([(f"{title} ({len(jobs)})", None)] + [(format_job(j, new_ids), j.get("Num")) for j in jobs], chat_id)
 
 
-def send_daily_digest(summary: Dict[str, Any]) -> None:
+def send_daily_digest(chat_id: str, added: int = 0, expired: Optional[int] = None) -> None:
+    """Sends one user their list: only jobs scored against their own CV."""
     if not is_configured():
-        print("[Telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping digest.")
+        print("[Telegram] TELEGRAM_BOT_TOKEN not set, skipping digest.")
         return
 
-    active = jobs_db.active_jobs()
+    active = jobs_db.active_jobs(chat_id)
     top = [j for j in active if int(j.get("Match_Score") or 0) >= min_score()]
     medium = [j for j in active if j.get("Match_Level") == "MEDIUM"]
     closing = [j for j in top if (jobs_db.days_left(j) is not None and jobs_db.days_left(j) <= CLOSING_SOON_DAYS)]
-    new_ids = set(jobs_db.last_added_ids())
+    new_ids = set(jobs_db.new_job_ids(chat_id))
+    expired_part = f" · ❌ {expired} expired & removed" if expired is not None else ""
 
     header = (
         f"📋 <b>Daily job list — {jobs_db.today():%b %d}</b>\n"
-        f"🆕 {summary.get('added', 0)} new · ❌ {summary.get('expired', 0)} expired & removed · "
+        f"🆕 {added} new{expired_part} · "
         f"⏰ {len(closing)} closing within {CLOSING_SOON_DAYS}d\n"
         f"Showing {len(top)} open jobs scored ≥ {min_score()}. Tap ✍️ <i>number</i> to tailor your CV."
     )
     # New first, then by score, so today's additions are at the top
     top.sort(key=lambda j: (str(j.get("Job_ID")) not in new_ids, -int(j.get("Match_Score") or 0)))
     footer = f"/medium for {len(medium)} medium matches · /closing · /help"
-    count = send_long([(header, None)] + [(format_job(j, new_ids), j.get("Num")) for j in top] + [(footer, None)])
-    print(f"[Telegram] Daily digest sent: {len(top)} jobs in {count} message(s).")
+    count = send_long([(header, None)] + [(format_job(j, new_ids), j.get("Num")) for j in top] + [(footer, None)], chat_id)
+    print(f"[Telegram] Digest for {chat_id} sent: {len(top)} jobs in {count} message(s).")
 
 
 def send_tailored_result(t: Dict[str, Any], chat_id: Optional[str] = None) -> None:
