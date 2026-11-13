@@ -1,0 +1,13 @@
+services:
+  job-matcher:
+    build: .
+    container_name: job-matcher
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=${TZ:-Asia/Dhaka}
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    volumes:
+      - ./backend/data:/app/backend/data
+      - ./backend/cv_store:/app/backend/cv_store

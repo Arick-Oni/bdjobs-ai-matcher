@@ -6,6 +6,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentFilter = 'all';
     let searchQuery = '';
     let pollingInterval = null;
+    let tailorPollTimer = null;
+    const openPanels = new Set();      // job ids whose tailoring details are expanded
+    const panelCache = {};             // job id -> tailored details from the API
 
     // DOM Elements
     const btnFetchMatch = document.getElementById('btn-fetch-match');
@@ -50,13 +53,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const cvFileInput = document.getElementById('cv-file-input');
     const dropzone = document.getElementById('dropzone');
 
-    // 1. Initialize Application
-    initApp();
 
     function initApp() {
         loadLatestJobs();
         loadCvInfo();
+        loadMasterCv();
         setupEvents();
+        setupMasterCv();
+        jobsContainer.addEventListener('click', onCardAction);
     }
 
     // Load Cached Jobs
@@ -73,6 +77,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 updateStats(data);
                 renderJobs();
             }
+            scheduleTailorPoll();
         } catch (err) {
             console.error('Failed to load cached jobs:', err);
         }
@@ -125,6 +130,8 @@ document.addEventListener('DOMContentLoaded', () => {
             filtered = filtered.filter(j => j.Match_Level === 'MEDIUM');
         } else if (currentFilter === 'LOW') {
             filtered = filtered.filter(j => j.Match_Level === 'LOW' || j.Match_Level === 'IRRELEVANT');
+        } else if (currentFilter === 'tailored') {
+            filtered = filtered.filter(j => ['done', 'working', 'failed'].includes(j.Tailor_Status) || j.Applied);
         } else if (currentFilter === 'src-bdjobs') {
             filtered = filtered.filter(j => (j.Source || 'BDJobs').toLowerCase() === 'bdjobs');
         } else if (currentFilter === 'src-linkedin') {
@@ -191,13 +198,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 applyBtnLabel = 'Apply on Remotive';
             }
 
+            card.dataset.jobId = job.Job_ID;
             card.innerHTML = `
                 <div class="job-card-top">
                     <div class="job-title-group">
                         <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
                             <span class="source-badge ${srcBadgeClass}"><i class="${srcIcon}"></i> ${srcLabel}</span>
                         </div>
-                        <h3>${escapeHtml(job.Title || 'Untitled Job')}</h3>
+                        <h3><span class="job-num">#${job.Num ?? ''}</span> ${escapeHtml(job.Title || 'Untitled Job')}</h3>
                         <div class="company-name">${escapeHtml(job.Company || 'Confidential Company')}</div>
                     </div>
                     <div class="match-badge ${badgeClass}">
@@ -218,8 +226,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     </div>
                 ` : ''}
 
+                ${renderTailorActions(job)}
+                ${openPanels.has(job.Job_ID) ? renderTailorPanel(job) : ''}
+
                 <div class="card-footer">
-                    <span class="deadline-text"><i class="fa-regular fa-clock"></i> ${job.Deadline ? `Deadline: ${escapeHtml(job.Deadline)}` : `Posted: ${escapeHtml(job.Publish_Date || 'Recent')}`}</span>
+                    ${renderDeadline(job)}
                     ${job.Job_URL ? `
                         <a href="${job.Job_URL}" target="_blank" rel="noopener noreferrer" class="apply-btn ${applyBtnClass}">
                             ${applyBtnLabel} <i class="fa-solid fa-arrow-up-right-from-square"></i>
@@ -265,7 +276,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 try {
                     const isFresher = chkFresher ? chkFresher.checked : true;
                     const sourcesParam = encodeURIComponent(selectedSources.join(','));
-                    const res = await fetch(`/api/match-jobs?is_fresher=${isFresher}&deadline_today=true&sources=${sourcesParam}`, {
+                    const res = await fetch(`/api/match-jobs?is_fresher=${isFresher}&deadline_today=false&sources=${sourcesParam}`, {
                         method: 'POST'
                     });
 
@@ -433,10 +444,205 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await res.json();
             alert(`CV '${data.filename}' uploaded successfully!`);
             loadCvInfo();
+            loadMasterCv();
         } catch (err) {
             alert('Failed to upload CV: ' + err.message);
             loadCvInfo();
         }
+    }
+
+    // ---------- CV tailoring ----------
+
+    function renderDeadline(job) {
+        if (!job.Deadline_ISO) {
+            return `<span class="deadline-text"><i class="fa-regular fa-clock"></i> ${job.Deadline ? escapeHtml(job.Deadline) : `Posted: ${escapeHtml(job.Publish_Date || 'Recent')}`}</span>`;
+        }
+        const dl = new Date(job.Deadline_ISO.slice(0, 10) + 'T23:59:59');
+        const days = Math.floor((dl - new Date()) / 86400000);
+        const left = days <= 0 ? 'today' : `${days}d left`;
+        return `<span class="deadline-text ${days <= 2 ? 'urgent' : ''}"><i class="fa-regular fa-clock"></i> Deadline: ${escapeHtml(job.Deadline)} (${left})</span>`;
+    }
+
+    function renderTailorActions(job) {
+        const id = escapeHtml(job.Job_ID);
+        const applied = job.Applied ? '<span class="status-pill pill-applied"><i class="fa-solid fa-check"></i> Applied</span>' : '';
+        const markApplied = job.Applied ? '' : `<button class="action-btn" data-action="applied" data-id="${id}"><i class="fa-regular fa-square-check"></i> Mark applied</button>`;
+        switch (job.Tailor_Status) {
+            case 'working':
+                return `<div class="card-actions"><span class="status-pill pill-working"><i class="fa-solid fa-spinner fa-spin"></i> Tailoring your CV… (~1 min)</span></div>`;
+            case 'done':
+                return `<div class="card-actions">
+                    <a class="action-btn success" href="/api/tailored/${encodeURIComponent(job.Job_ID)}/pdf" target="_blank" rel="noopener"><i class="fa-solid fa-file-arrow-down"></i> Tailored CV</a>
+                    <button class="action-btn" data-action="details" data-id="${id}"><i class="fa-solid fa-list-check"></i> ${openPanels.has(job.Job_ID) ? 'Hide details' : 'Details'}</button>
+                    <button class="action-btn" data-action="cover" data-id="${id}"><i class="fa-regular fa-envelope"></i> Cover letter</button>
+                    ${markApplied}${applied}
+                </div>`;
+            case 'failed':
+                return `<div class="card-actions">
+                    <span class="status-pill pill-failed"><i class="fa-solid fa-triangle-exclamation"></i> Tailoring failed</span>
+                    <button class="action-btn" data-action="tailor" data-id="${id}"><i class="fa-solid fa-rotate-right"></i> Retry</button>
+                    ${applied}
+                </div>`;
+            default:
+                return `<div class="card-actions">
+                    <button class="action-btn primary" data-action="tailor" data-id="${id}"><i class="fa-solid fa-pen-nib"></i> Tailor CV</button>
+                    ${markApplied}${applied}
+                </div>`;
+        }
+    }
+
+    function renderTailorPanel(job) {
+        const d = panelCache[job.Job_ID];
+        if (!d) return `<div class="tailor-panel"><span><i class="fa-solid fa-spinner fa-spin"></i> Loading…</span></div>`;
+        const list = (items, cls = '') => items && items.length ? `<ul class="${cls}">${items.map(i => `<li>${escapeHtml(i)}</li>`).join('')}</ul>` : '<p>None.</p>';
+        const before = (d.keywords_before || {}).percent || 0;
+        const after = (d.keywords_after || {}).percent || 0;
+        const missing = (d.keywords_after || {}).missing || [];
+        return `<div class="tailor-panel">
+            <div>
+                <h4>Keyword match</h4>
+                <div class="score-row"><span>${before}%</span>
+                    <div class="score-bar"><span class="after" style="width:${after}%"></span><span class="before" style="width:${before}%"></span></div>
+                    <span style="color:var(--high-fit)">${after}%</span></div>
+            </div>
+            <div><h4>What changed</h4>${list(d.changes)}</div>
+            <div><h4>Gaps to address</h4>${list(d.gaps, 'gaps')}</div>
+            ${(d.removed_claims || []).length ? `<div><h4>Removed by fact-check</h4>${list(d.removed_claims.map(c => c.text), 'removed')}</div>` : ''}
+            ${missing.length ? `<div><h4>Keywords still missing</h4><p>${escapeHtml(missing.join(', '))}</p></div>` : ''}
+            ${d.cover_letter ? `<div><h4>Cover letter</h4><div class="cover-letter">${escapeHtml(d.cover_letter)}</div></div>` : ''}
+        </div>`;
+    }
+
+    async function loadPanel(jobId) {
+        const res = await fetch(`/api/tailored/${encodeURIComponent(jobId)}`);
+        if (res.ok) panelCache[jobId] = await res.json();
+        renderJobs();
+    }
+
+    async function onCardAction(e) {
+        const btn = e.target.closest('[data-action]');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        const action = btn.dataset.action;
+        btn.disabled = true;
+        try {
+            if (action === 'tailor') {
+                const res = await fetch(`/api/tailor/${encodeURIComponent(id)}`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Could not start tailoring');
+                const job = allJobs.find(j => j.Job_ID === id);
+                if (job) job.Tailor_Status = 'working';
+                showToast('Tailoring started. The PDF will also arrive in Telegram.');
+                renderJobs();
+                scheduleTailorPoll();
+            } else if (action === 'details') {
+                if (openPanels.has(id)) { openPanels.delete(id); renderJobs(); }
+                else { openPanels.add(id); renderJobs(); await loadPanel(id); }
+            } else if (action === 'cover') {
+                openPanels.add(id);
+                showToast('Writing your cover letter…');
+                renderJobs();
+                const res = await fetch(`/api/tailored/${encodeURIComponent(id)}/cover`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Cover letter failed');
+                await loadPanel(id);
+            } else if (action === 'applied') {
+                const res = await fetch(`/api/tailored/${encodeURIComponent(id)}/applied`, { method: 'POST' });
+                if (!res.ok) throw new Error('Could not update');
+                const job = allJobs.find(j => j.Job_ID === id);
+                if (job) job.Applied = true;
+                showToast('Marked as applied. Good luck!');
+                renderJobs();
+            }
+        } catch (err) {
+            showToast(err.message);
+            btn.disabled = false;
+        }
+    }
+
+    // Refresh the list while any CV is being tailored, so the card flips to "done" by itself
+    function scheduleTailorPoll() {
+        clearTimeout(tailorPollTimer);
+        if (allJobs.some(j => j.Tailor_Status === 'working')) {
+            tailorPollTimer = setTimeout(async () => {
+                await loadLatestJobs();
+                for (const id of openPanels) loadPanel(id);
+            }, 4000);
+        }
+    }
+
+    // ---------- Master CV ----------
+
+    const masterStatus = document.getElementById('master-cv-status');
+    const masterEditorWrap = document.getElementById('master-editor-wrap');
+    const masterJson = document.getElementById('master-cv-json');
+    const btnMasterBuild = document.getElementById('btn-master-build');
+
+    async function loadMasterCv() {
+        try {
+            const res = await fetch('/api/master-cv');
+            const data = await res.json();
+            if (!data.cv) {
+                masterStatus.innerText = 'Not built yet. It is built automatically the first time you tailor, or tap "Build from PDF" to check it first.';
+                btnMasterBuild.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Build from PDF';
+            } else {
+                const n = (data.cv.sections || []).length;
+                masterStatus.innerText = `${data.cv.name || 'CV'} · ${n} sections${data.edited ? ' · edited by you' : ''}` +
+                    (data.up_to_date ? '' : ' · ⚠️ out of date: a new PDF was uploaded (rebuilt on next tailoring)');
+                btnMasterBuild.innerHTML = '<i class="fa-solid fa-rotate"></i> Rebuild from PDF';
+                masterJson.value = JSON.stringify(data.cv, null, 2);
+            }
+        } catch (err) {
+            masterStatus.innerText = 'Could not load master CV.';
+        }
+    }
+
+    function setupMasterCv() {
+        btnMasterBuild.addEventListener('click', async () => {
+            if (masterJson.value && !confirm('Rebuild from the PDF? Your manual edits will be replaced.')) return;
+            btnMasterBuild.disabled = true;
+            masterStatus.innerText = 'Reading your CV with Gemini…';
+            try {
+                const res = await fetch('/api/master-cv/rebuild', { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Build failed');
+                showToast('Master CV built. Check it with Preview.');
+            } catch (err) {
+                showToast(err.message);
+            }
+            btnMasterBuild.disabled = false;
+            loadMasterCv();
+        });
+        document.getElementById('btn-master-edit').addEventListener('click', () => {
+            if (!masterJson.value) { showToast('Build the master CV first.'); return; }
+            masterEditorWrap.classList.toggle('hidden');
+        });
+        document.getElementById('btn-master-cancel').addEventListener('click', () => {
+            masterEditorWrap.classList.add('hidden');
+            loadMasterCv();
+        });
+        document.getElementById('btn-master-save').addEventListener('click', async () => {
+            let cv;
+            try { cv = JSON.parse(masterJson.value); }
+            catch (err) { showToast('That is not valid JSON: ' + err.message); return; }
+            const res = await fetch('/api/master-cv', {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cv)
+            });
+            const data = await res.json();
+            if (!res.ok) { showToast(data.detail || 'Save failed'); return; }
+            showToast('Master CV saved.');
+            masterEditorWrap.classList.add('hidden');
+            loadMasterCv();
+        });
+    }
+
+    let toastTimer = null;
+    function showToast(msg) {
+        const toast = document.getElementById('toast');
+        toast.innerText = msg;
+        toast.classList.remove('hidden');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.add('hidden'), 3500);
     }
 
     function escapeHtml(str) {
@@ -447,4 +653,7 @@ document.addEventListener('DOMContentLoaded', () => {
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#039;");
     }
+
+    // Initialize last, so every const above is defined before it's used
+    initApp();
 });

@@ -114,10 +114,13 @@ def fetch_bdjobs(is_fresher: bool = True, deadline_today: bool = True, max_pages
 def fetch_all_jobs(
     sources: Optional[List[str]] = None,
     is_fresher: bool = True,
-    deadline_today: bool = True
+    deadline_today: bool = True,
+    linkedin_keywords: Optional[List[str]] = None,
+    remotive_categories: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Unified multi-site aggregator for BDJobs, LinkedIn Bangladesh, and Remotive Tech.
+    Unified multi-site aggregator for BDJobs, LinkedIn Bangladesh, and Remotive.
+    LinkedIn keywords and Remotive categories come from users' CVs (jobs_db.search_terms()).
     """
     if not sources:
         sources = ["bdjobs", "linkedin", "remotive"]
@@ -125,26 +128,27 @@ def fetch_all_jobs(
     sources_lower = [s.lower().strip() for s in sources]
     combined_jobs = []
 
-    # 1. BDJobs
+    # 1. BDJobs. Users range from freshers to experienced, so the fresher listing is fetched alongside the full one:
+    # the full listing alone would fill its pages with experienced roles and push fresher ones out
     if "bdjobs" in sources_lower or "all" in sources_lower:
-        try:
-            bd_jobs = fetch_bdjobs(is_fresher=is_fresher, deadline_today=deadline_today)
-            combined_jobs.extend(bd_jobs)
-        except Exception as e:
-            print(f"[MultiScraper Error] BDJobs scraper failed: {e}")
+        for fresher_pass in ([True, False] if is_fresher else [False]):
+            try:
+                combined_jobs.extend(fetch_bdjobs(is_fresher=fresher_pass, deadline_today=deadline_today))
+            except Exception as e:
+                print(f"[MultiScraper Error] BDJobs scraper failed (fresher={fresher_pass}): {e}")
 
     # 2. LinkedIn Bangladesh
     if "linkedin" in sources_lower or "all" in sources_lower:
         try:
-            li_jobs = fetch_linkedin_jobs()
+            li_jobs = fetch_linkedin_jobs(keywords=linkedin_keywords)
             combined_jobs.extend(li_jobs)
         except Exception as e:
             print(f"[MultiScraper Error] LinkedIn scraper failed: {e}")
 
-    # 3. Remotive Global Remote Tech
+    # 3. Remotive (remote jobs)
     if "remotive" in sources_lower or "all" in sources_lower:
         try:
-            rem_jobs = fetch_remotive_jobs()
+            rem_jobs = fetch_remotive_jobs(categories=remotive_categories)
             combined_jobs.extend(rem_jobs)
         except Exception as e:
             print(f"[MultiScraper Error] Remotive scraper failed: {e}")

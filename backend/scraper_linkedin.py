@@ -24,7 +24,8 @@ def fetch_linkedin_jobs(
     """
     Fetches job listings from LinkedIn Bangladesh via public guest search.
     """
-    if keywords is None:
+    if not keywords:
+        # Only used when no user has search terms yet (each user's come from their CV)
         keywords = [
             "software engineer", 
             "python developer", 
@@ -91,7 +92,7 @@ def fetch_linkedin_jobs(
                     "Title": title,
                     "Company": company,
                     "Location": loc,
-                    "Experience": "Fresher / Mid",
+                    "Experience": "Not stated",  # The guest search card doesn't show it; don't guess for scoring
                     "Deadline": "Open / Apply soon",
                     "Deadline_ISO": "",
                     "Publish_Date": posted_date,
@@ -99,7 +100,7 @@ def fetch_linkedin_jobs(
                     "Job_Type": "Full-time / Hybrid",
                     "Workplace": "On-site / Hybrid",
                     "Salary": "Negotiable / Standard",
-                    "Category_ID": "LinkedIn Tech",
+                    "Category_ID": f"LinkedIn: {kw}",
                     "Job_URL": job_url,
                     "Source": "LinkedIn"
                 }
